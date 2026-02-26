@@ -21,6 +21,7 @@ from ..model.attention import (
 from ..model.feed_forward import SwiGLU
 from ..model.rope import TimeAwareRotaryEmbedding
 from ..model.util import KVCache, RMSNorm, make_batched_block_mask
+from .fusion import Fusion
 
 try:
     from xformers.ops.swiglu_op import SwiGLU as SwiGLU_fused
@@ -175,6 +176,8 @@ class Transformer(torch.nn.Module):
         spacewise_every_n_layers: int,
         spacewise_first: bool,
         use_memory_efficient_attention: bool = True,
+        *,
+        fusion: Optional[Fusion] = None,
     ):
         super().__init__()
 
@@ -189,6 +192,7 @@ class Transformer(torch.nn.Module):
         attention_axes = self._get_layer_types(num_layers, spacewise_every_n_layers, spacewise_first)
 
         self.use_memory_efficient_attention = use_memory_efficient_attention
+        self.fusion = fusion
 
         self.layers = torch.nn.ModuleList(
             [
@@ -296,9 +300,29 @@ class Transformer(torch.nn.Module):
         inputs: Float[torch.Tensor, "batch variate seq_len embed_dim"],
         id_mask: Float[torch.Tensor, "batch #variate seq_len"],
         kv_cache: Optional[KVCache] = None,
+        variate_label_embeds: Optional[Float[torch.Tensor, "batch variate 1 embed_dim"]] = None,
     ) -> Float[torch.Tensor, "batch variate seq_len embed_dim"]:
 
+        # Apply fusion (prepend variate label embeddings) only once at the beginning
+        # Skip when KV cache indicates we are in incremental decoding steps
+        if self.fusion is not None and variate_label_embeds is not None:
+            should_apply_fusion = True
+            if kv_cache is not None:
+                kv_len_tensor = kv_cache.current_len(0)
+                kv_len = int(kv_len_tensor) if isinstance(kv_len_tensor, torch.Tensor) else kv_len_tensor
+                should_apply_fusion = kv_len == 0
+            if should_apply_fusion:
+                inputs = self.fusion(inputs, variate_label_embeds=variate_label_embeds)
+
         batch, _, seq_len, _ = inputs.shape
+
+        # If fusion prepended tokens, pad id_mask along seq_len to match
+        # by repeating the first timestep mask for the number of added tokens.
+        if id_mask is not None and id_mask.shape[-1] != seq_len:
+            added = int(seq_len - id_mask.shape[-1])
+            if added > 0:
+                pad_slice = id_mask[..., :1]  # (batch, variate, 1)
+                id_mask = torch.cat([pad_slice.expand(-1, -1, added), id_mask], dim=-1)
         # Get the sequence length by looking up a timewise layer in the kv cache.
         # Regardless of whether spacewise is first in the stack, the layer
         # at index 1 is always a timewise layer.
