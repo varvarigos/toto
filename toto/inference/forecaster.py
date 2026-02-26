@@ -78,12 +78,28 @@ class TotoForecaster:
 
     The forecaster handles data preprocessing, including padding to match the model's patch size,
     and postprocessing to format the outputs as a Forecast object containing means and optional samples.
+
+    Exogenous Variables:
+        When using exogenous variables, they MUST be placed at the END of the variates/channels dimension
+        in the input tensor. For example, if you have 3 target variates and 2 exogenous variables,
+        the input shape should be (batch, 5, time_steps) where:
+        - indices 0, 1, 2 correspond to target variates
+        - indices 3, 4 correspond to exogenous variables
+
+        This convention allows the forecaster to correctly inject known future values of exogenous
+        variables during autoregressive decoding by replacing the last `num_exogenous_variables`
+        channels with the provided `future_exogenous_variables`.
     """
 
     model: TotoBackbone
 
-    def __init__(self, model: TotoBackbone):
+    def __init__(
+        self,
+        model: TotoBackbone,
+    ):
         self.model = model
+        # set the model to evaluation mode
+        self.model.eval()
 
     def forecast(
         self,
@@ -92,6 +108,7 @@ class TotoForecaster:
         num_samples: int | None = None,
         samples_per_batch: int = 10,
         use_kv_cache: bool = True,
+        future_exogenous_variables: Float[torch.Tensor, "batch exogenous_variables future_time_steps"] | None = None,
     ) -> Forecast:
         """
         Generate a forecast for a batch of time series. This method works autoregressively,
@@ -101,6 +118,7 @@ class TotoForecaster:
         2. For each future time step:
             - The model generates a distribution over possible values
             - Either the mean or random samples are drawn from this distribution
+            - If known future exogenous variables are provided, they are injected into the samples to replace the predicted values
             - The generated value(s) are appended to the input sequence
             - The process repeats with this extended sequence
 
@@ -135,6 +153,15 @@ class TotoForecaster:
             use_kv_cache:
                 Whether to use a key-value cache for the model. In most cases, this should be True,
                 as it significantly speeds up inference.
+            future_exogenous_variables:
+                If known future exogenous variables are provided, they are injected into the samples
+                to replace the predicted values after each prediction step.
+
+                IMPORTANT: Exogenous variables MUST be placed at the END of the variates/channels
+                dimension in the input tensor. The forecaster assumes that the last `num_exogenous_variables`
+                channels in `inputs.series` correspond to exogenous variables. During autoregressive
+                decoding, predictions for these channels are replaced with the known future values
+                from `future_exogenous_variables`.
         """
         if len(inputs.series.shape) == 2:
             # unbatched input, variates x time_steps
@@ -142,6 +169,9 @@ class TotoForecaster:
         else:
             # input is already batched
             batch = inputs
+
+        if future_exogenous_variables is not None and len(future_exogenous_variables.shape) == 2:
+            future_exogenous_variables = future_exogenous_variables.unsqueeze(0)
 
         # pad the input to the nearest multiple of the patch size
         series = pad_array(batch.series, self.model.patch_embed.stride)
@@ -165,6 +195,8 @@ class TotoForecaster:
                 id_mask=id_mask,
                 sampling_batch_size=samples_per_batch,
                 use_kv_cache=use_kv_cache,
+                future_exogenous_variables=future_exogenous_variables,
+                num_exogenous_variables=batch.num_exogenous_variables,
             )
             mean = samples.mean(dim=-1)
         else:
@@ -176,10 +208,45 @@ class TotoForecaster:
                 input_padding_mask=padding_mask,
                 id_mask=id_mask,
                 use_kv_cache=use_kv_cache,
+                future_exogenous_variables=future_exogenous_variables,
+                num_exogenous_variables=batch.num_exogenous_variables,
             )
             samples = None
 
         return Forecast(mean=mean, samples=samples)
+
+    def assert_ev_compatibility(
+        self,
+        inputs: Float[torch.Tensor, "batch total_variate patch_time_steps"],
+        future_exogenous_variables: Float[torch.Tensor, "batch exogenous_variables future_time_steps"],
+        prediction_length: int,
+        num_exogenous_variables: int,
+    ) -> None:
+        """
+        Assert the compatibility of the future exogenous variables with the input.
+        """
+        assert (
+            future_exogenous_variables.shape[-1] == prediction_length
+        ), "The future exogenous variables must have the same length as the prediction length"
+        assert (
+            future_exogenous_variables.shape[0] == inputs.shape[0]
+        ), "The future exogenous variables must have the same batch size as the input"
+        assert (
+            num_exogenous_variables == future_exogenous_variables.shape[-2]
+        ), "The number of exogenous variables must match the number of exogenous variables in the future_exogenous_variables"
+
+    def round_ft_ev(
+        self,
+        future_exogenous_variables: Float[torch.Tensor, "batch exogenous_variables future_time_steps"],
+        T_rounded: int,
+    ) -> Float[torch.Tensor, "batch exogenous_variables rounded_steps"]:
+        # add padding to the future exogenous variables to the nearest multiple of the patch size
+        B, V_ev, T_future = future_exogenous_variables.shape
+        dtype = future_exogenous_variables.dtype
+        device = future_exogenous_variables.device
+        padding = torch.zeros(B, V_ev, T_rounded - T_future, device=device, dtype=dtype)
+        padded_future_exogenous_variables = torch.cat([future_exogenous_variables, padding], dim=-1)
+        return padded_future_exogenous_variables
 
     @torch.no_grad()
     def generate_mean(
@@ -191,20 +258,36 @@ class TotoForecaster:
         input_padding_mask: Bool[torch.Tensor, "batch variate time_steps"] | None = None,
         id_mask: Float[torch.Tensor, "batch #variate time_steps"] | None = None,
         use_kv_cache: bool = False,
+        future_exogenous_variables: Float[torch.Tensor, "batch exogenous_variables future_time_steps"] | None = None,
+        num_exogenous_variables: int = 0,
     ) -> Float[torch.Tensor, "batch variate time_steps"]:
         """
         Generate a point prediction by taking the mean of the output distribution at each step.
         This method works autoregressively, i.e. it feeds the model's predictions back into itself
         to generate the next prediction.
+
+        If future exogenous variables are provided, they are injected into the samples to replace
+        the predicted values after each prediction step.
+
+        Note:
+            Exogenous variables MUST be placed at the END of the variates/channels dimension.
+            The last `num_exogenous_variables` channels are assumed to be exogenous variables
+            and will be replaced with values from `future_exogenous_variables` during decoding.
         """
         if input_padding_mask is None:
             input_padding_mask = torch.ones_like(inputs, dtype=torch.bool, device=inputs.device)
         if id_mask is None:
             id_mask = torch.zeros_like(inputs, dtype=torch.int, device=inputs.device)
 
+        # Assert the compatibility of the future exogenous variables with the input
+        if future_exogenous_variables is not None:
+            self.assert_ev_compatibility(inputs, future_exogenous_variables, prediction_length, num_exogenous_variables)
+
         ## round up the prediction length to the nearest multiple of the patch size
         patch_size = self.model.patch_embed.stride
         rounded_steps = int(np.ceil(prediction_length / patch_size) * patch_size)
+        if rounded_steps > prediction_length and future_exogenous_variables is not None:
+            future_exogenous_variables = self.round_ft_ev(future_exogenous_variables, rounded_steps)
         start_index = inputs.shape[-1]
         end_index = start_index + prediction_length
 
@@ -232,19 +315,27 @@ class TotoForecaster:
 
         scaling_prefix_length = inputs.shape[-1]
 
-        for _ in range(rounded_steps // patch_size):
+        for idx in range(rounded_steps // patch_size):
             base_distr, loc, scale = self.model(
                 inputs=inputs,
                 input_padding_mask=input_padding_mask,
                 id_mask=id_mask,
                 kv_cache=kv_cache,
                 scaling_prefix_length=scaling_prefix_length,
+                num_exogenous_variables=num_exogenous_variables,
             )
             distr = self.create_affine_transformed(base_distr, loc, scale)
 
             # We remove extreme values that can occur early in training
             # and cause validation metrics to be NaN
             samples = replace_extreme_values(distr.mean[:, :, -patch_size:])
+
+            # If future exogenous variables are provided, inject them into the samples to replace
+            # the predicted values. Note: exogenous variables are assumed to be the LAST channels
+            # in the variates dimension, hence we use `[:, -num_exogenous_variables:]` indexing.
+            if future_exogenous_variables is not None:
+                start, stop = idx * patch_size, (idx + 1) * patch_size
+                samples[:, -num_exogenous_variables:] = future_exogenous_variables[:, :, start:stop]
 
             inputs = torch.cat([inputs, samples], dim=-1)
             id_mask = torch.cat([id_mask, dummy_id_mask], dim=-1)
@@ -267,6 +358,8 @@ class TotoForecaster:
         id_mask: Float[torch.Tensor, "batch #variate time_steps"] | None = None,
         sampling_batch_size: int = 10,
         use_kv_cache: bool = False,
+        future_exogenous_variables: Float[torch.Tensor, "batch exogenous_variables future_time_steps"] | None = None,
+        num_exogenous_variables: int = 0,
     ) -> Float[torch.Tensor, "batch variate time_steps samples"]:
         """
         Generate samples from the output distribution.
@@ -274,11 +367,22 @@ class TotoForecaster:
         It works by creating num_samples chains. Each chain is a separate sequence of predictions.
         At each time step, for each chain we take a single sample from the output distribution and append
         it to the end of the sequence.
+
+        If future exogenous variables are provided, they are injected into the samples to replace
+        the predicted values after each prediction step.
+
+        Note:
+            Exogenous variables MUST be placed at the END of the variates/channels dimension.
+            The last `num_exogenous_variables` channels are assumed to be exogenous variables
+            and will be replaced with values from `future_exogenous_variables` during decoding.
         """
         if input_padding_mask is None:
             input_padding_mask = torch.ones_like(inputs, dtype=torch.bool, device=inputs.device)
         if id_mask is None:
             id_mask = torch.zeros_like(inputs, dtype=torch.int, device=inputs.device)
+
+        if future_exogenous_variables is not None:
+            self.assert_ev_compatibility(inputs, future_exogenous_variables, prediction_length, num_exogenous_variables)
 
         assert num_samples % sampling_batch_size == 0, "num_samples must be divisible by sampling_batch_size"
         num_batches = num_samples // sampling_batch_size
@@ -286,6 +390,8 @@ class TotoForecaster:
         # round up the prediction length to the nearest multiple of the patch size
         patch_size = self.model.patch_embed.patch_size
         rounded_steps = int(np.ceil(prediction_length / patch_size) * patch_size)
+        if rounded_steps > prediction_length and future_exogenous_variables is not None:
+            future_exogenous_variables = self.round_ft_ev(future_exogenous_variables, rounded_steps)
         start_index = inputs.shape[-1]
         end_index = start_index + prediction_length
 
@@ -298,6 +404,7 @@ class TotoForecaster:
             dtype=torch.bool,
             device=inputs.device,
         )
+
         dummy_id_mask = repeat(
             id_mask[:, :, -1:],
             "batch variates 1 -> (sampling_batch_size batch) variates patch_size",
@@ -309,6 +416,12 @@ class TotoForecaster:
             "batch variates seq_len -> (sampling_batch_size batch) variates seq_len",
             sampling_batch_size=sampling_batch_size,
         )
+        if future_exogenous_variables is not None:
+            future_exogenous_variables = repeat(
+                future_exogenous_variables,
+                "batch exogenous_variables future_time_steps -> (sampling_batch_size batch) exogenous_variables future_time_steps",
+                sampling_batch_size=sampling_batch_size,
+            )
         input_padding_mask = repeat(
             input_padding_mask,
             "batch variates seq_len -> (sampling_batch_size batch) variates seq_len",
@@ -350,13 +463,14 @@ class TotoForecaster:
             batch_id_mask = torch.clone(id_mask)
             batch_timestamp_seconds = torch.clone(timestamp_seconds)
 
-            for _ in range(rounded_steps // patch_size):
+            for idx in range(rounded_steps // patch_size):
                 base_distr, loc, scale = self.model(
                     inputs=batch_inputs,
                     input_padding_mask=batch_input_padding_mask,
                     id_mask=batch_id_mask,
                     kv_cache=kv_cache,
                     scaling_prefix_length=scaling_prefix_length,
+                    num_exogenous_variables=num_exogenous_variables,
                 )
                 distr = self.create_affine_transformed(base_distr, loc, scale)
 
@@ -366,6 +480,13 @@ class TotoForecaster:
                 # We remove extreme values that can occur early in training
                 # and cause validation metrics to be NaN
                 samples = replace_extreme_values(sample[:, :, -patch_size:])
+
+                # If future exogenous variables are provided, inject them into the samples to replace
+                # the predicted values. Note: exogenous variables are assumed to be the LAST channels
+                # in the variates dimension, hence we use `[:, -num_exogenous_variables:]` indexing.
+                if future_exogenous_variables is not None:
+                    start, stop = idx * patch_size, (idx + 1) * patch_size
+                    samples[:, -num_exogenous_variables:] = future_exogenous_variables[:, :, start:stop]
                 batch_inputs = torch.cat([batch_inputs, samples], dim=-1)
                 batch_id_mask = torch.cat([batch_id_mask, dummy_id_mask], dim=-1)
                 batch_input_padding_mask = torch.cat([batch_input_padding_mask, dummy_padding], dim=-1)

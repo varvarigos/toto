@@ -110,6 +110,11 @@ class MaskedTimeseries(NamedTuple):
     The time frequency of each variate in seconds
     """
 
+    num_exogenous_variables: int = 0
+    """
+    Number of exogenous variates. The last num_exogenous_variables variates are treated as exogenous.
+    """
+
     def to(self, device: torch.device) -> "MaskedTimeseries":
         return MaskedTimeseries(
             series=self.series.to(device),
@@ -117,6 +122,59 @@ class MaskedTimeseries(NamedTuple):
             id_mask=self.id_mask.to(device),
             timestamp_seconds=self.timestamp_seconds.to(device),
             time_interval_seconds=self.time_interval_seconds.to(device),
+            num_exogenous_variables=self.num_exogenous_variables,
+        )
+
+
+class CausalMaskedTimeseries(NamedTuple):
+    # CausalMaskedTimeseries has an additional input_slice and target_slice fields that are used during the model training to indicate the context and target regions.
+    # Note: "*batch" indicates the batch dimension is optional.
+    series: Float[torch.Tensor, "*batch variates series_len"]  # noqa: F722
+    """
+    The time series data.
+    """
+    padding_mask: Bool[torch.Tensor, "*batch variates series_len"]  # noqa: F722
+    """
+    A mask that indicates which values are padding. If padding_mask[..., i] is True,
+    then series[..., i] is _NOT_ padding; i.e., it's a valid value in the time series.
+    """
+    id_mask: Int[torch.Tensor, "*batch variates #series_len"]  # noqa: F722
+    """
+    A mask that indicates the group ID of each variate. Any
+    variates with the same ID are considered to be part of the same multivariate
+    time series, and can attend to each other.
+    """
+    timestamp_seconds: Int[torch.Tensor, "*batch variates series_len"]  # noqa: F722
+    """
+    A POSIX timestamp in seconds for each time step in the series.
+    """
+    time_interval_seconds: Int[torch.Tensor, "*batch variates"]  # noqa: F722
+    """
+    The time frequency of each variate in seconds
+    """
+    input_slice: slice
+    """
+    The slice of the series that is used as input.
+    """
+    target_slice: slice
+    """
+    The slice of the series that is used as target.
+    """
+    num_exogenous_variables: int = 0
+    """
+    Number of exogenous variates. The last num_exogenous_variables variates are treated as exogenous.
+    """
+
+    def to(self, device: torch.device) -> "CausalMaskedTimeseries":
+        return CausalMaskedTimeseries(
+            series=self.series.to(device),
+            padding_mask=self.padding_mask.to(device),
+            id_mask=self.id_mask.to(device),
+            timestamp_seconds=self.timestamp_seconds.to(device),
+            time_interval_seconds=self.time_interval_seconds.to(device),
+            input_slice=self.input_slice,
+            target_slice=self.target_slice,
+            num_exogenous_variables=self.num_exogenous_variables,
         )
 
 

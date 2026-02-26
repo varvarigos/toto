@@ -5,18 +5,28 @@ Toto is a foundation model for multivariate time series forecasting with a focus
 
 This repository also hosts the code for evaluating time series models on BOOM (**B**enchmark **o**f **O**bservability **M**etrics), a large-scale forecasting dataset composed of real-world observability data.
 
+## Updates
+
+- 🎉🎉 **[Feb 2025] Fine-tuning Support**: You can now fine-tune Toto on your own datasets! Includes a ready-to-use training script, example configs, and a hands-on tutorial notebook to get you started.
+- 📈 **[Feb 2025] Exogenous Covariate Support**: Toto now supports known future exogenous covariates (e.g., weather forecasts, scheduled events) during both fine-tuning and inference to improve forecasting accuracy.
+
 ## Table of Contents
+- [Updates](#updates)
 - [Toto model](#toto-model)
   - [Features](#features)
   - [Model Weights](#model-weights)
   - [Installation](#installation)
   - [Quick Start](#quick-start)
   - [Tutorials](#tutorials)
-  - [Training Data](#training-data)
+  - [Pre-Training Data](#pre-training-data)
   - [Evaluation](#evaluation)
     - [LSF Evaluation](#lsf-evaluation)
     - [GIFT-Eval Evaluation](#gift-eval-evaluation)
     - [BOOM Evaluation](#boom-evaluation)
+  - [🆕 Fine-tuning](#-fine-tuning)
+    - [Running the Fine-tuning Script](#running-the-fine-tuning-script)
+    - [Configuration](#configuration)
+    - [Custom Datasets](#custom-datasets)
   - [Requirements](#requirements)
 - [BOOM (Benchmark of Observability Metrics)](#boom-benchmark-of-observability-metrics)
 - [Citation](#citation)
@@ -57,6 +67,15 @@ source .venv/bin/activate
 # Install via pip
 pip install toto-ts
 ```
+
+Or install as a local editable package (recommended for development or fine-tuning):
+
+```bash
+cd Toto
+pip install -r requirements.txt
+pip install -e .
+```
+
 For optimal inference speed, it's recommended to install [xformers](https://github.com/facebookresearch/xformers?tab=readme-ov-file#installing-xformers) and [flash-attention](https://github.com/Dao-AILab/flash-attention?tab=readme-ov-file#installation-and-features) as well.
 
 ### Quick Start
@@ -116,6 +135,7 @@ upper_quantile = forecast.quantile(0.9)  # 90th percentile for upper confidence 
 For a comprehensive guide on using Toto for time series forecasting, check out our tutorial notebooks:
 
 - [Basic Inference Tutorial](toto/notebooks/inference_tutorial.ipynb): Learn how to load the model and make forecasts
+- [Fine-tuning Tutorial](toto/notebooks/finetuning_tutorial.ipynb): Learn how to fine-tune Toto on custom datasets with or without exogenous covariates
 
 ### Pre-Training Data
 
@@ -200,6 +220,108 @@ For evaluating Toto on the BOOM (Benchmark of Observability Metrics) dataset, re
 - [BOOM README](boom/README.md): Detailed instructions and scripts for benchmarking on BOOM.
 
 These resources provide all necessary steps to run and reproduce BOOM evaluation results with Toto.
+
+### 🆕 Fine-tuning
+
+Toto can be fine-tuned on your own domain-specific datasets to improve performance on specialized forecasting tasks. The fine-tuning pipeline supports both standard time series and datasets with exogenous (known future) variables.
+
+#### Fine-tuning Tutorial
+
+To fine-tune Toto, use the provided [finetuning tutorial](toto/notebooks/finetuning_tutorial.ipynb), which demonstrates fine-tuning with and without exogenous variables.
+
+To customize the fine-tuning recipe, modify the base configuration in [finetune_config.yaml](toto/scripts/configs/finetune_config.yaml).
+
+By default, the tutorial uses the `proenfo_gfc12` dataset from the [autogluon/fev_datasets](https://huggingface.co/datasets/autogluon/fev_datasets) collection.
+
+#### Custom Datasets
+
+There are two ways to use custom datasets for fine-tuning:
+
+##### Option A: HuggingFace Dataset with Configuration Dictionary
+
+The simplest approach is to use a HuggingFace `datasets.Dataset` configured via a dictionary. Modify the `prepare_dataset()` function in [benchmark_finetuning.py](toto/scripts/benchmark_finetuning.py) to load your data:
+
+```python
+custom_dataset = {
+    "dataset": dataset,              # HuggingFace Dataset object
+    "target_fields": ["target"],     # List of field names for target variables
+    "target_transform_fns": [...],   # Transform functions for each target field
+    "ev_fields": ["temp", "humidity"],  # List of exogenous covariate field names
+    "ev_transform_fns": [...],       # Transform functions for each exogenous field
+    "dataset_name": "my_dataset",    # Name of your custom dataset
+}
+```
+
+**HuggingFace Dataset Requirements:**
+
+Your dataset must contain:
+- `timestamp`: A 1D array of timestamps for each time series
+- Target fields (e.g., `target`): Arrays of shape `(T,)` for each target variable
+- Exogenous fields (optional): Arrays of shape `(T,)` for each dynamic exogenous variable
+
+The pipeline uses [FinetuneDataModule](toto/data/datamodule/finetune_datamodule.py), which internally converts your data into `CausalMaskedTimeseries` objects (the input format expected by Toto during fine-tuning) via GluonTS transforms.
+
+##### Option B: Custom PyTorch Dataset and DataModule
+
+For full control over data loading, you can implement your own PyTorch `Dataset` that returns `CausalMaskedTimeseries` objects and wrap it in a custom `LightningDataModule`.
+
+**Step 1:** Create a Dataset class that returns `CausalMaskedTimeseries`:
+
+```python
+from torch.utils.data import Dataset
+from toto.data.util.dataset import CausalMaskedTimeseries
+
+class MyCustomDataset(Dataset):
+    ...
+    def __getitem__(self, idx: int) -> CausalMaskedTimeseries:
+        # Build and return a CausalMaskedTimeseries for this sample
+        # See toto/data/datasets/gluonts_dataset.py for a reference implementation
+        ...
+```
+
+**Step 2:** Create a custom `LightningDataModule`:
+
+```python
+from lightning import LightningDataModule
+from torch.utils.data import DataLoader
+from toto.data.util.helpers import collate_causal
+
+class MyFinetuneDataModule(LightningDataModule):
+    def __init__(self, train_dataset: MyCustomDataset, val_dataset: MyCustomDataset, ...):
+        ...
+
+    def train_dataloader(self) -> DataLoader:
+        return DataLoader(self.train_dataset, collate_fn=collate_causal, ...)  # collate_fn is required
+
+    def val_dataloader(self) -> DataLoader:
+        return DataLoader(self.val_dataset, collate_fn=collate_causal, ...)
+```
+
+**Step 3:** Modify [finetune_toto.py](toto/scripts/finetune_toto.py) to use your custom DataModule:
+
+```python
+# Replace the get_datamodule() call with your custom DataModule
+dm = MyFinetuneDataModule(train_dataset, val_dataset, batch_size=16)
+_ = train(module, dm, config)
+```
+
+#### Evaluations on FEV Datasets
+
+The [benchmark_finetuning.py](toto/scripts/benchmark_finetuning.py) script evaluates Toto on a subset of FEV datasets that are not included in Toto’s pretraining corpus. These datasets contain known exogenous variables, enabling a comparison of three approaches:
+
+- **Zero-shot Toto** — No fine-tuning
+- **Fine-tuned Toto** — Fine-tuned without exogenous variables
+- **Fine-tuned Toto with Exogenous Variables** — Fine-tuned with known future covariates
+
+Models are evaluated using sliding windows on the test set (10% of each dataset), with context length and horizon configured per FEV task. Results are aggregated using the geometric mean across datasets in [aggregate_results.ipynb](toto/evaluation/fev/aggregate_results.ipynb):
+
+| Model | MAE | WQL | MASE |
+|:------|----------:|-------------------:|-----:|
+| Toto (zero-shot) | 6150.242 | 0.111 | 0.632 |
+| Toto (fine-tuned) | <u>5397.929</u> | <u>0.100</u> | <u>0.574</u> |
+| Toto (fine-tuned + exogenous) | **5117.002** | **0.096** | **0.535** |
+
+
 
 ### Requirements
 
