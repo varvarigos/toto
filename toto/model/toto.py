@@ -11,7 +11,6 @@ from typing import Dict, Optional, Union
 
 import safetensors.torch as safetorch
 import torch
-# from huggingface_hub import ModelHubMixin, constants, hf_hub_download
 from huggingface_hub import snapshot_download
 
 from ..model.attention import XFORMERS_AVAILABLE
@@ -129,41 +128,6 @@ class Toto(torch.nn.Module):
 
         local_path = snapshot_download(repo_id=model_id)
         return cls.load_from_checkpoint(local_path, map_location, strict, **kwargs)
-
-    # @classmethod
-    # def _from_pretrained(
-    #     cls,
-    #     *,
-    #     model_id: str,
-    #     revision: Optional[str],
-    #     cache_dir: Optional[Union[str, Path]],
-    #     force_download: bool,
-    #     proxies: Optional[Dict],
-    #     resume_download: Optional[bool],
-    #     local_files_only: bool,
-    #     token: Union[str, bool, None],
-    #     map_location: str = "cpu",
-    #     strict: bool = False,
-    #     **model_kwargs,
-    # ):
-    #     """Load Pytorch pretrained weights and return the loaded model."""
-    #     if os.path.isdir(model_id):
-    #         print("Loading weights from local directory")
-    #         model_file = os.path.join(model_id, constants.SAFETENSORS_SINGLE_FILE)
-    #         return cls.load_from_checkpoint(model_file, map_location, strict, **model_kwargs)
-    #     else:
-    #         model_file = hf_hub_download(
-    #             repo_id=model_id,
-    #             filename=constants.SAFETENSORS_SINGLE_FILE,
-    #             revision=revision,
-    #             cache_dir=cache_dir,
-    #             force_download=force_download,
-    #             proxies=proxies,
-    #             resume_download=resume_download,
-    #             token=token,
-    #             local_files_only=local_files_only,
-    #         )
-    #         return cls.load_from_checkpoint(model_file, map_location, strict, **model_kwargs)
 
     @staticmethod
     def _map_state_dict_keys(state_dict, use_fused_swiglu):
